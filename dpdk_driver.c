@@ -15,11 +15,6 @@
 #include <rte_mbuf.h>
 #include <rte_ether.h>
 
-#if DPDK_GPU_SUPPORT
-#include <rte_gpu.h>
-#include <rte_gpu_comm.h>
-#endif
-
 /* Default configuration values */
 #define DEFAULT_RX_RING_SIZE 1024
 #define DEFAULT_TX_RING_SIZE 1024
@@ -490,54 +485,4 @@ void dpdk_metrics_cleanup(dpdk_metrics_t *metrics)
         free(metrics->ports);
         metrics->ports = NULL;
     }
-}
-
-#if DPDK_GPU_SUPPORT
-/* GPU-related API implementations */
-
-void* dpdk_gpu_mem_alloc(int16_t dev_id, size_t size, unsigned int flags)
-{
-    return rte_gpu_mem_alloc(dev_id, size, flags);
-}
-
-int dpdk_gpu_mem_free(int16_t dev_id, void *ptr)
-{
-    return rte_gpu_mem_free(dev_id, ptr);
-}
-
-int dpdk_gpu_comm_create_flag(int16_t dev_id, void *flag, int flag_type)
-{
-    return rte_gpu_comm_create_flag(dev_id, flag, flag_type);
-}
-
-int dpdk_gpu_comm_set_flag(void *flag, uint32_t value)
-{
-    return rte_gpu_comm_set_flag(flag, value);
-}
-
-void* dpdk_gpu_comm_create_list(int16_t dev_id, int num_entries)
-{
-    return rte_gpu_comm_create_list(dev_id, num_entries);
-}
-
-int dpdk_gpu_comm_populate_list_pkts(void *comm_list, void **pkts, int nb_pkts)
-{
-    return rte_gpu_comm_populate_list_pkts(comm_list, pkts, nb_pkts);
-}
-
-int dpdk_gpu_comm_cleanup_list(void *comm_list)
-{
-    return rte_gpu_comm_cleanup_list(comm_list);
-}
-
-int dpdk_extmem_register(void *addr, size_t len, void *context, uint64_t iova, size_t page_size)
-{
-    return rte_extmem_register(addr, len, context, iova, page_size);
-}
-
-int dpdk_dev_dma_map(uint16_t port_id, void *addr, uint64_t iova, size_t len)
-{
-    struct rte_device *dev = rte_eth_devices[port_id].device;
-    return rte_dev_dma_map(dev, addr, iova, len);
-}
-#endif /* DPDK_GPU_SUPPORT */ 
+} 
