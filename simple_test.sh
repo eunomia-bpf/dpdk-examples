@@ -4,7 +4,10 @@
 
 set -e
 
+# Get script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "=== DPDK Test and Benchmark Framework ==="
+echo "Script running from: $SCRIPT_DIR"
 
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then
@@ -14,7 +17,8 @@ fi
 
 # Check if DPDK GPU support is available
 HAS_GPU_SUPPORT=0
-if [ -f "/usr/include/rte_gpu.h" ] || [ -f "/usr/local/include/rte_gpu.h" ]; then
+if [ -f "/usr/include/rte_gpu.h" ] || [ -f "/usr/local/include/rte_gpu.h" ] || \
+   [ -f "/usr/include/rte_gpudev.h" ] || [ -f "/usr/local/include/rte_gpudev.h" ]; then
     HAS_GPU_SUPPORT=1
     echo "DPDK GPU support detected."
 else
@@ -33,7 +37,7 @@ reset_and_setup_hugepages() {
     fi
     
     # Unmount if already mounted
-    if mount | grep -q "hugetlbfs"; then
+    if mount | grep -q "hugetlbfs.*on.*/mnt/huge"; then
         umount /mnt/huge
         echo "Unmounted existing hugepage filesystem"
     fi
@@ -74,7 +78,7 @@ reset_and_setup_hugepages() {
 
 # Compile the applications
 echo "1. Compiling the DPDK applications..."
-make
+cd "$SCRIPT_DIR" && make
 
 if [ $? -eq 0 ]; then
     echo "✓ Compilation successful!"
@@ -98,21 +102,25 @@ run_test() {
     echo ""
     echo "=== Running $app with $test_type (${duration}s) ==="
     
-    # Check if the application exists in current directory
-    if [ ! -f "./$app" ]; then
-        # Check if application exists in eBPF-on-GPU/example directory
-        if [ -f "/root/yunwei37/eBPF-on-GPU/example/$app" ]; then
-            echo "Using $app from /root/yunwei37/eBPF-on-GPU/example/"
-            app="/root/yunwei37/eBPF-on-GPU/example/$app"
-        else
-            echo "❌ $app not found. Skipping test."
-            return 1
-        fi
+    # Build the full path based on the app name
+    local app_path=""
+    
+    # First check current directory
+    if [ -f "$SCRIPT_DIR/$app" ]; then
+        app_path="$SCRIPT_DIR/$app"
+        echo "Using $app from current directory"
+    # Then check eBPF-on-GPU directory (relative to script location)
+    elif [ -f "$SCRIPT_DIR/../eBPF-on-GPU/example/$app" ]; then
+        app_path="$SCRIPT_DIR/../eBPF-on-GPU/example/$app"
+        echo "Using $app from eBPF-on-GPU/example/"
+    else
+        echo "❌ $app not found. Skipping test."
+        return 1
     fi
     
     if [ "$test_type" = "null" ]; then
         # Run with null PMD (auto-generates packets)
-        timeout $duration $app --vdev=net_null0 -l 0 --file-prefix=$app$$ -m 256 || echo "Test completed"
+        timeout $duration $app_path --vdev=net_null0 -l 0 --file-prefix=$app$$ -m 256 || echo "Test completed"
         
     elif [ "$test_type" = "tap" ]; then
         # Create and configure the TAP interface before starting the DPDK application
@@ -131,7 +139,7 @@ run_test() {
             echo "✓ TAP interface 'test0' created and configured successfully"
             
             # Start the DPDK application with the TAP interface
-            $app --vdev=net_tap0,iface=test0 -l 0 --file-prefix=$app$$ -m 256 &
+            $app_path --vdev=net_tap0,iface=test0 -l 0 --file-prefix=$app$$ -m 256 &
             local pid=$!
             
             echo "Generating traffic for ${duration}s..."
@@ -176,19 +184,19 @@ extract_metrics() {
 echo ""
 echo "3. Running tests and benchmarks..."
 
-# Run dpdk_example tests
-echo "Running CPU tests with dpdk_example..."
-CPU_NULL_OUTPUT=$(run_test "dpdk_example" "null" $TEST_DURATION)
-CPU_TAP_OUTPUT=$(run_test "dpdk_example" "tap" $TEST_DURATION)
+# Run dpdk_minimal tests
+echo "Running CPU tests with dpdk_minimal..."
+CPU_NULL_OUTPUT=$(run_test "dpdk_minimal" "null" $TEST_DURATION)
+CPU_TAP_OUTPUT=$(run_test "dpdk_minimal" "tap" $TEST_DURATION)
 
-# Run dpdk_gpu tests only if GPU support is available
-if [ $HAS_GPU_SUPPORT -eq 1 ] && [ -f "./dpdk_gpu" ]; then
-    echo "Running GPU tests with dpdk_gpu..."
+# Run dpdk_gpu tests
+echo "Running GPU tests with dpdk_gpu..."
+if [ $HAS_GPU_SUPPORT -eq 1 ]; then
     GPU_NULL_OUTPUT=$(run_test "dpdk_gpu" "null" $TEST_DURATION)
     GPU_TAP_OUTPUT=$(run_test "dpdk_gpu" "tap" $TEST_DURATION)
 else
     echo ""
-    echo "Skipping GPU tests (GPU support not available or dpdk_gpu not built)"
+    echo "Skipping GPU tests (GPU support not available)"
 fi
 
 # Print results summary
@@ -211,7 +219,7 @@ if [ "$CPU_TAP_RX_RATE" = "N/A" ]; then
 fi
 echo "CPU TAP RX Rate: ${CPU_TAP_RX_RATE} pps"
 
-if [ $HAS_GPU_SUPPORT -eq 1 ] && [ -f "./dpdk_gpu" ]; then
+if [ $HAS_GPU_SUPPORT -eq 1 ] && [ -n "$GPU_NULL_OUTPUT" ]; then
     GPU_NULL_RX_RATE=$(extract_metrics "Average RX Rate" "$GPU_NULL_OUTPUT")
     GPU_NULL_PROC_RATE=$(extract_metrics "Average Processing Rate" "$GPU_NULL_OUTPUT")
     GPU_NULL_PROC_TIME=$(extract_metrics "Average Processing Time" "$GPU_NULL_OUTPUT")
@@ -220,25 +228,13 @@ if [ $HAS_GPU_SUPPORT -eq 1 ] && [ -f "./dpdk_gpu" ]; then
     echo "GPU Null PMD Processing Rate: ${GPU_NULL_PROC_RATE} pps"
     echo "GPU Null PMD Processing Time: ${GPU_NULL_PROC_TIME} us/packet"
     
-    GPU_TAP_RX_RATE=$(extract_metrics "Average RX Rate" "$GPU_TAP_OUTPUT")
-    GPU_TAP_PROC_RATE=$(extract_metrics "Average Processing Rate" "$GPU_TAP_OUTPUT")
-    GPU_TAP_PROC_TIME=$(extract_metrics "Average Processing Time" "$GPU_TAP_OUTPUT")
-    
-    echo "GPU TAP RX Rate: ${GPU_TAP_RX_RATE} pps"
-    echo "GPU TAP Processing Rate: ${GPU_TAP_PROC_RATE} pps"
-    echo "GPU TAP Processing Time: ${GPU_TAP_PROC_TIME} us/packet"
+    if [ -n "$GPU_TAP_OUTPUT" ]; then
+        GPU_TAP_RX_RATE=$(extract_metrics "Average RX Rate" "$GPU_TAP_OUTPUT")
+        GPU_TAP_PROC_RATE=$(extract_metrics "Average Processing Rate" "$GPU_TAP_OUTPUT")
+        GPU_TAP_PROC_TIME=$(extract_metrics "Average Processing Time" "$GPU_TAP_OUTPUT")
+        
+        echo "GPU TAP RX Rate: ${GPU_TAP_RX_RATE} pps"
+        echo "GPU TAP Processing Rate: ${GPU_TAP_PROC_RATE} pps"
+        echo "GPU TAP Processing Time: ${GPU_TAP_PROC_TIME} us/packet"
+    fi
 fi
-
-echo ""
-echo "Test Summary:"
-echo "- CPU tests show baseline performance"
-if [ $HAS_GPU_SUPPORT -eq 1 ] && [ -f "./dpdk_gpu" ]; then
-    echo "- GPU tests show GPU-accelerated packet processing performance"
-    echo "- Higher RX Rate and Processing Rate values are better"
-    echo "- Lower Processing Time values are better"
-else
-    echo "- GPU tests were not run (GPU support not available)"
-    echo "- To enable GPU support, run: sudo make install-deps"
-fi
-echo ""
-echo "==================================" 

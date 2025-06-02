@@ -30,6 +30,8 @@ CC = gcc
 NVCC = nvcc
 CFLAGS = -O3 -Wall -Wextra -std=c99 -D_GNU_SOURCE -include rte_config.h $(DPDK_CFLAGS)
 LDFLAGS = $(DPDK_LDFLAGS) -lrt -lpthread -ldl
+# For NVCC, we need to pass library flags differently
+NVCC_LDFLAGS = -Xlinker -L/usr/local/lib $(shell pkg-config --libs-only-l libdpdk | sed 's/-l/\-Xlinker -l/g') -Xlinker -lrt -Xlinker -lpthread -Xlinker -ldl
 
 # Default target builds both apps
 all: $(MINIMAL_APP) $(GPU_APP)
@@ -40,7 +42,7 @@ $(MINIMAL_APP): $(COMMON_OBJS) $(MINIMAL_OBJS)
 
 # Build the GPU application
 $(GPU_APP): $(COMMON_OBJS) $(GPU_OBJS)
-	$(NVCC) -o $@ $^ $(LDFLAGS) $(CUDA_LDFLAGS)
+	$(NVCC) -o $@ $^ $(NVCC_LDFLAGS) $(CUDA_LDFLAGS)
 
 # Build GPU object file with nvcc
 $(GPU_OBJS): $(GPU_SRCS)

@@ -32,6 +32,10 @@
 #define COMM_LIST_ENTRIES 8
 #define MAX_PORTS 32
 
+#define GPU_COMM_LIST_READY 1
+#define GPU_COMM_LIST_PKTS_MAX 64
+#define GPU_COMM_FLAG_CPU 0
+
 /* Signal handler */
 static volatile bool force_quit = false;
 
@@ -42,10 +46,6 @@ static dpdk_metrics_t g_metrics;
 struct gpu_flag {
     uint32_t *ptr;
 };
-
-#define GPU_COMM_LIST_READY 1
-#define GPU_COMM_LIST_PKTS_MAX 64
-#define GPU_COMM_FLAG_CPU 0
 
 struct gpu_comm_list {
     uint32_t *status_d;
@@ -69,6 +69,7 @@ static uint64_t get_timestamp_us(void)
     return (uint64_t)(ts.tv_sec * 1000000 + ts.tv_nsec / 1000);
 }
 
+#ifdef __CUDACC__
 /* CUDA kernel for simple packet processing */
 __global__ void cuda_packet_processing(uint32_t *quit_flag, 
                                       struct gpu_comm_list *comm_list, 
@@ -95,6 +96,7 @@ __global__ void cuda_packet_processing(uint32_t *quit_flag,
         list_index = (list_index + 1) % list_count;
     }
 }
+#endif
 
 int main(int argc, char *argv[])
 {
@@ -132,11 +134,10 @@ int main(int argc, char *argv[])
     struct gpu_flag quit_flag = {0};
     struct gpu_comm_list *comm_list = NULL;
     int nb_rx = 0;
-    int comm_list_entry = 0;
+    int queue_id = 0;
     struct rte_mbuf *rx_mbufs[MAX_RX_MBUFS];
     cudaStream_t cuda_stream;
     int gpu_device_id = 0;
-    int queue_id = 0;
     
     /* Initialize CUDA */
     cudaError_t cuda_status;
@@ -202,10 +203,14 @@ int main(int argc, char *argv[])
     }
     
     /* Start CUDA kernel */
+    #ifdef __CUDACC__
     cuda_packet_processing<<<1, GPU_COMM_LIST_PKTS_MAX, 0, cuda_stream>>>(
         d_quit_flag, comm_list, COMM_LIST_ENTRIES);
+    #else
+    printf("CUDA compilation not available, using CPU for packet processing\n");
+    #endif
     
-    printf("Packet processing running on GPU. Press Ctrl+C to exit...\n");
+    printf("Packet processing started. Press Ctrl+C to exit...\n");
     
     /* Arrays for metrics calculation */
     uint32_t rx_packets_by_port[MAX_PORTS] = {0};
