@@ -8,22 +8,24 @@ GPU_APP = dpdk_gpu
 COMMON_SRCS = dpdk_driver.c
 MINIMAL_SRCS = dpdk_minimal.c
 GPU_SRCS = dpdk_gpu.c
+GPU_CUDA_SRCS = dpdk_gpu_kernel.cu
 
 # Object files
 COMMON_OBJS = $(COMMON_SRCS:.c=.o)
 MINIMAL_OBJS = $(MINIMAL_SRCS:.c=.o)
 GPU_OBJS = $(GPU_SRCS:.c=.o)
+GPU_CUDA_OBJS = $(GPU_CUDA_SRCS:.cu=.o)
 
 # Header files
-HEADERS = dpdk_driver.h
+HEADERS = dpdk_driver.h dpdk_gpu.h
 
 # DPDK configuration
 DPDK_CFLAGS = $(shell pkg-config --cflags libdpdk)
 DPDK_LDFLAGS = $(shell pkg-config --libs libdpdk)
 
 # CUDA configuration
-CUDA_CFLAGS = -I/usr/include
-CUDA_LDFLAGS = -L/usr/lib/x86_64-linux-gnu -lcudart -lcuda
+CUDA_CFLAGS = -I/usr/include -I/usr/local/cuda/include
+CUDA_LDFLAGS = -L/usr/lib/x86_64-linux-gnu -L/usr/local/cuda/lib64 -lcudart -lcuda
 
 # Compiler and flags
 CC = gcc
@@ -41,12 +43,16 @@ $(MINIMAL_APP): $(COMMON_OBJS) $(MINIMAL_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # Build the GPU application
-$(GPU_APP): $(COMMON_OBJS) $(GPU_OBJS)
-	$(NVCC) -o $@ $^ $(NVCC_LDFLAGS) $(CUDA_LDFLAGS)
+$(GPU_APP): $(COMMON_OBJS) $(GPU_OBJS) $(GPU_CUDA_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) $(CUDA_LDFLAGS)
 
-# Build GPU object file with nvcc
-$(GPU_OBJS): $(GPU_SRCS)
-	$(NVCC) --compiler-options "-fPIC $(CFLAGS)" -c -o $@ $<
+# Build GPU object file
+$(GPU_OBJS): $(GPU_SRCS) $(HEADERS)
+	$(CC) $(CFLAGS) $(CUDA_CFLAGS) -c -o $@ $<
+
+# Build CUDA object file with nvcc
+$(GPU_CUDA_OBJS): $(GPU_CUDA_SRCS)
+	$(NVCC) $(CUDA_CFLAGS) -c -o $@ $<
 
 # Build regular object files
 %.o: %.c $(HEADERS)
@@ -54,7 +60,7 @@ $(GPU_OBJS): $(GPU_SRCS)
 
 # Clean rule
 clean:
-	rm -f $(MINIMAL_APP) $(GPU_APP) $(COMMON_OBJS) $(MINIMAL_OBJS) $(GPU_OBJS)
+	rm -f $(MINIMAL_APP) $(GPU_APP) $(COMMON_OBJS) $(MINIMAL_OBJS) $(GPU_OBJS) $(GPU_CUDA_OBJS)
 
 # Test with different virtual devices
 test-null:

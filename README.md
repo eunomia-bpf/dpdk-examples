@@ -15,8 +15,7 @@ This application demonstrates how to use DPDK with GPU acceleration for packet p
 3. Make the build script executable and run it:
 
 ```bash
-chmod +x build_dpdk_gpu.sh
-./build_dpdk_gpu.sh
+make
 ```
 
 The application will be built in the `build` directory.
@@ -26,14 +25,14 @@ The application will be built in the `build` directory.
 The application requires DPDK EAL initialization parameters. You can run it with:
 
 ```bash
-sudo ./build/dpdk_gpu [EAL options]
+sudo ./dpdk_gpu [EAL options]
 ```
 
 For example:
 
 ```bash
 # Run with 4 cores on socket 0 and use a virtual device
-sudo ./build/dpdk_gpu -l 0-3 -n 4 --vdev=net_pcap0,iface=eth0
+sudo ./dpdk_gpu -l 0-3 -n 4 --vdev=net_pcap0,iface=eth0
 ```
 
 ### Notes on GPU Processing
