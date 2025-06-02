@@ -1,144 +1,231 @@
-# Simple DPDK Packet Processor Example
+# DPDK Packet Processing with GPU Acceleration
 
-This is a minimal DPDK example that demonstrates packet processing using virtual devices. **No GPU or physical NICs required!**
+This project demonstrates DPDK packet processing with and without GPU acceleration. It includes both a minimal CPU-only version and a GPU-accelerated version for comparison.
 
 ## Features
 
-- Works with DPDK virtual devices (null PMD, TAP, ring)
-- Simple packet capture and processing
-- Easy to test and understand
-- No hardware dependencies
+- CPU-only and GPU-accelerated packet processing
+- Works with DPDK virtual devices (null PMD, TAP)
+- Performance metrics collection and benchmarking
+- No physical NICs required for testing
 
-## Quick Start
+## Prerequisites
 
-### 1. Install DPDK (if not already installed)
+### System Requirements
+
+- Ubuntu 18.04/20.04/22.04 or compatible Linux distribution
+- CUDA-capable GPU (for GPU acceleration)
+- DPDK 20.11 or later with GPU support
+- CUDA Toolkit 10.0 or later
+
+## Installation
+
+### Quick Start
+
+The simplest way to get started is to run:
 
 ```bash
-sudo apt update
-sudo apt install -y dpdk dpdk-dev libdpdk-dev
-```
+# Clone the repository
+git clone <repository-url>
+cd dpdk-examples
 
-### 2. Run the Test
+# Install DPDK with GPU support (if needed)
+sudo ./install_deps.sh
 
-```bash
-# Run the automated test script
+# Build the applications
+make
+
+# Run the benchmark suite
 sudo ./simple_test.sh
 ```
 
-The script will:
-- Compile the application
-- Set up hugepages
-- Test with null PMD (auto-generates packets)
-- Test with TAP interface (creates virtual network interface)
+### Manual Installation
 
-### 3. Manual Testing
+#### 1. Install DPDK with GPU Support
+
+DPDK with GPU support requires a specific build configuration. Here's how to install it:
 
 ```bash
-# Compile manually
-gcc -I/usr/include/dpdk -I/usr/include/x86_64-linux-gnu/dpdk \
-    -include rte_config.h -march=native \
-    minimal_dpdk_example.c -o minimal_dpdk_example \
-    $(pkg-config --libs libdpdk)
+# Install basic dependencies
+sudo apt update
+sudo apt install -y build-essential meson ninja-build python3-pyelftools libnuma-dev
 
-# Test with null PMD (auto-generates packets)
-sudo ./minimal_dpdk_example --vdev=net_null0 -l 0
+# Install CUDA Toolkit (if not already installed)
+# Visit https://developer.nvidia.com/cuda-downloads for the latest version
+# Example for Ubuntu 20.04:
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-ubuntu2004.pin
+sudo mv cuda-ubuntu2004.pin /etc/apt/preferences.d/cuda-repository-pin-600
+sudo apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/7fa2af80.pub
+sudo add-apt-repository "deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/ /"
+sudo apt update
+sudo apt install -y cuda
 
-# Test with TAP interface
-sudo ./minimal_dpdk_example --vdev=net_tap0,iface=test0 -l 0
-# In another terminal: ping test0
+# Download and build DPDK with GPU support
+git clone https://github.com/DPDK/dpdk.git
+cd dpdk
+git checkout v21.11 # Or a later version
+meson -Denable_docs=false -Denable_kmods=false -Dlibdir=lib -Denable_drivers=net/null,net/tap,gpu/cuda builddir
+cd builddir
+ninja
+sudo ninja install
+sudo ldconfig
+
+# Verify installation
+pkg-config --modversion libdpdk
+```
+
+#### 2. Configure Hugepages
+
+DPDK requires hugepages for its memory pools. You can configure them using:
+
+```bash
+# Configure hugepages on all NUMA nodes
+sudo ./reset_hugepages.sh
+```
+
+Or manually:
+
+```bash
+# Create mount point if it doesn't exist
+sudo mkdir -p /mnt/huge
+
+# Mount hugetlbfs
+sudo mount -t hugetlbfs nodev /mnt/huge
+
+# Configure 256 hugepages for each NUMA node
+# For a single NUMA node system:
+echo 256 | sudo tee /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
+
+# For multi-NUMA node systems, repeat for each node:
+echo 256 | sudo tee /sys/devices/system/node/node1/hugepages/hugepages-2048kB/nr_hugepages
+```
+
+## Usage
+
+### Basic Testing
+
+```bash
+# Test CPU-only version with null PMD (auto-generates packets)
+sudo make test-null
+
+# Test CPU-only version with TAP interface
+sudo make test-tap
+
+# Test GPU-accelerated version with null PMD
+sudo make test-gpu-null
+
+# Test GPU-accelerated version with TAP interface
+sudo make test-gpu-tap
+```
+
+### Run Benchmark Suite
+
+```bash
+# Run comprehensive benchmarks for both CPU and GPU versions
+sudo make benchmark
+
+# Or directly:
+sudo ./simple_test.sh
+```
+
+## Project Structure
+
+- `dpdk_driver.h/c` - Core DPDK functionality and GPU integration
+- `dpdk_minimal.c` - CPU-only packet processing application
+- `dpdk_gpu.c` - GPU-accelerated packet processing application
+- `simple_test.sh` - Automated test and benchmark script
+- `install_deps.sh` - Script to install DPDK with GPU support
+- `reset_hugepages.sh` - Script to reset and reconfigure hugepages
+
+## Benchmarking
+
+The benchmark suite measures and compares:
+
+- Packet throughput (packets per second)
+- Processing time per packet
+- Total processed packets
+- CPU vs. GPU performance
+
+Example benchmark output:
+
+```
+=== Benchmark Results Summary ===
+==================================
+CPU Null PMD RX Rate: 1245678.45 pps
+CPU TAP RX Rate: 23456.78 pps
+GPU Null PMD RX Rate: 2345678.90 pps
+GPU Null PMD Processing Rate: 2345678.90 pps
+GPU Null PMD Processing Time: 0.42 us/packet
+GPU TAP RX Rate: 45678.90 pps
+GPU TAP Processing Rate: 45678.90 pps
+GPU TAP Processing Time: 0.45 us/packet
 ```
 
 ## Understanding the Code
 
-The `minimal_dpdk_example.c` shows:
+### CPU Version (`dpdk_minimal.c`)
 
-1. **DPDK Initialization**: Sets up the DPDK Environment Abstraction Layer (EAL)
-2. **Port Setup**: Configures virtual network ports
-3. **Packet Reception**: Captures packets using `rte_eth_rx_burst()`
-4. **Packet Processing**: Simple packet inspection and statistics
-5. **Memory Management**: Proper cleanup of packet buffers
+The CPU-only version demonstrates:
+- DPDK initialization and setup
+- Packet reception and processing
+- Metrics collection
 
-## Virtual Device Types
+### GPU Version (`dpdk_gpu.c`)
 
-### null PMD
-- **Usage**: `--vdev=net_null0`
-- **Purpose**: Auto-generates packets for testing
-- **Good for**: Performance testing, basic functionality verification
+The GPU-accelerated version adds:
+- CPU-GPU communication
+- CUDA kernel for parallel packet processing
+- Performance optimization with GPU memory
 
-### TAP PMD
-- **Usage**: `--vdev=net_tap0,iface=test0`
-- **Purpose**: Creates a virtual network interface accessible from the host
-- **Good for**: Real packet testing, integration with host networking
+### GPU Processing Flow
 
-### Ring PMD
-- **Usage**: `--vdev=net_ring0`
-- **Purpose**: Creates ring-based packet sharing between applications
-- **Good for**: Inter-process communication, complex testing scenarios
-
-## Expected Output
-
-```
-=== Setting up DPDK test environment ===
-1. Compiling the DPDK application...
-✓ Compilation successful!
-2. Setting up hugepages...
-Hugepages already configured: 256
-3. Testing different virtual devices...
-
-=== Test 1: null PMD (auto-generates packets) ===
-Running for 5 seconds...
-Found 1 ports
-Device info: driver=net_null
-Port 0 MAC: 02 00 00 00 00 00
-Starting packet processing...
-...
-Core 0 processing packets. [Ctrl+C to quit]
-Received 32 packets on port 0 (total: 32)
-  Packet 0: length = 64 bytes
-  Packet 1: length = 64 bytes
-  Packet 2: length = 64 bytes
-Total packets processed: 1000
-...
-Test completed
-
-=== Test 2: TAP interface ===
-Creating TAP interface...
-Starting DPDK application with TAP interface...
-...
-✓ TAP interface 'test0' created successfully
-✓ TAP test completed
-
-=== Test Summary ===
-Both tests demonstrate DPDK packet processing with virtual devices.
-...
-```
-
-## Next Steps
-
-This example provides a foundation for:
-
-1. **Adding Custom Packet Processing**: Modify the packet processing logic in `lcore_main()`
-2. **Integration with Other Systems**: Use TAP interfaces to connect with real networks
-3. **Performance Testing**: Use null PMD for high-throughput testing
-4. **GPU Integration**: Add GPU processing to the packet handling pipeline
+1. CPU receives packets via DPDK
+2. Packets are sent to GPU via DPDK-GPU communication API
+3. CUDA kernel processes packets in parallel
+4. Results are synchronized back to CPU
+5. Performance metrics are collected and reported
 
 ## Troubleshooting
 
-### Compilation Errors
-- Make sure DPDK is properly installed: `pkg-config --exists libdpdk`
-- Check include paths: `pkg-config --cflags libdpdk`
+### Hugepage Issues
 
-### Runtime Errors
-- **No hugepages**: Run `sudo ./simple_test.sh` or set up hugepages manually
+If you see errors like:
+```
+EAL: No free 2048 kB hugepages reported on node X
+MBUF: error setting mempool handler
+Cannot create mbuf pool
+```
+
+Reset your hugepages using:
+```
+sudo ./reset_hugepages.sh
+```
+
+This script will:
+1. Unmount and remount the hugepage filesystem
+2. Reset and reconfigure hugepages for all NUMA nodes
+3. Verify the configuration
+
+### Missing DPDK GPU Support
+
+If you see errors like `rte_gpu.h: No such file or directory`, your DPDK installation doesn't include GPU support. Follow the installation instructions above to build DPDK with GPU support.
+
+If GPU support is not available, the build system will automatically disable GPU features and only build the CPU-only version.
+
+### CUDA Issues
+
+- Ensure CUDA Toolkit is installed: `nvcc --version`
+- Check GPU availability: `nvidia-smi`
+- Update CUDA_HOME in Makefile if needed
+
+### Common DPDK Issues
+
 - **Permission denied**: Run with `sudo` or add user to appropriate groups
 - **No ports found**: Make sure to use `--vdev` parameter
-
-### Common Issues
-- **CPU instruction errors**: The script tries different compilation flags automatically
-- **Interface creation fails**: Check if you have permissions to create network interfaces
+- **Multiple NUMA nodes**: Use `reset_hugepages.sh` to configure all nodes properly
 
 ## Learn More
 
 - [DPDK Documentation](https://doc.dpdk.org/)
-- [DPDK Programmer's Guide](https://doc.dpdk.org/guides/prog_guide/)
-- [Virtual Device Examples](https://doc.dpdk.org/guides/nics/) 
+- [DPDK GPU Guide](https://doc.dpdk.org/guides/prog_guide/gpu_accel.html)
+- [CUDA Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/) 

@@ -10,6 +10,12 @@
 # Precompiled Headers
 *.gch
 *.pch
+*.log
+
+dpdk_minimal
+dpdk_gpu
+dpdk
+
 
 # Compiled Dynamic libraries
 *.so

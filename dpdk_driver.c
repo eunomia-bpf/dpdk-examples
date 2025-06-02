@@ -4,6 +4,7 @@
 #include <string.h>
 #include <errno.h>
 #include <inttypes.h>  /* For PRIx8 format specifier */
+#include <time.h>      /* For clock_gettime() */
 
 /* DPDK headers */
 #include <rte_config.h>
@@ -13,6 +14,11 @@
 #include <rte_mempool.h>
 #include <rte_mbuf.h>
 #include <rte_ether.h>
+
+#if DPDK_GPU_SUPPORT
+#include <rte_gpu.h>
+#include <rte_gpu_comm.h>
+#endif
 
 /* Default configuration values */
 #define DEFAULT_RX_RING_SIZE 1024
@@ -173,13 +179,53 @@ int dpdk_init(int argc, char *argv[], const dpdk_config_t *config)
     }
 
     /* Creates a new mempool in memory to hold the mbufs */
-    g_mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS * g_nb_ports,
-        MBUF_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+    int socket_id = rte_socket_id();
+    printf("Creating mempool on socket %d\n", socket_id);
+    
+    /* Check for available hugepages */
+    printf("Hugepage info:\n");
+    system("grep -i huge /proc/meminfo");
+    
+    /* Reduce mempool size if we're having allocation issues */
+    uint32_t num_mbufs = 2048;  /* Reduced from the large NUM_MBUFS value */
+    uint32_t cache_size = 128;  /* Reduced cache size */
+    
+    /* Try different parameters to create the mempool */
+    printf("Attempting to create mempool with %u mbufs, cache size %u\n", 
+           num_mbufs, cache_size);
+    
+    g_mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", num_mbufs,
+        cache_size, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id);
 
     if (g_mbuf_pool == NULL) {
-        printf("Cannot create mbuf pool\n");
-        return -ENOMEM;
+        /* Try without cache */
+        printf("Cannot create mbuf pool with cache, trying without cache\n");
+        g_mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", num_mbufs,
+            0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id);
+        
+        if (g_mbuf_pool == NULL) {
+            /* Try with SOCKET_ID_ANY as fallback */
+            printf("Cannot create mbuf pool on socket %d, trying with SOCKET_ID_ANY\n", socket_id);
+            g_mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", num_mbufs,
+                0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, SOCKET_ID_ANY);
+                
+            if (g_mbuf_pool == NULL) {
+                /* Final fallback: minimal configuration */
+                printf("Still failing. Trying with minimal configuration\n");
+                g_mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", 1024,
+                    0, 0, 1024, SOCKET_ID_ANY);
+                    
+                if (g_mbuf_pool == NULL) {
+                    printf("Cannot create mbuf pool: %s (errno: %d)\n", 
+                           rte_strerror(rte_errno), rte_errno);
+                    printf("Please ensure hugepages are properly configured\n");
+                    return -ENOMEM;
+                }
+            }
+        }
     }
+    
+    printf("Mempool created successfully at %p\n", (void*)g_mbuf_pool);
 
     /* Initialize all ports */
     uint16_t portid;
@@ -318,4 +364,180 @@ void dpdk_cleanup(void)
     g_mbuf_pool = NULL;
     
     printf("DPDK cleanup complete\n");
-} 
+}
+
+/* Get current timestamp */
+static uint64_t get_timestamp_sec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec;
+}
+
+/* Get current timestamp in microseconds */
+static uint64_t get_timestamp_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)(ts.tv_sec * 1000000 + ts.tv_nsec / 1000);
+}
+
+/* Metrics API implementation */
+
+int dpdk_metrics_init(dpdk_metrics_t *metrics, uint16_t num_ports)
+{
+    if (!metrics || num_ports == 0) {
+        return -EINVAL;
+    }
+
+    /* Clear the metrics structure */
+    memset(metrics, 0, sizeof(dpdk_metrics_t));
+    
+    /* Allocate memory for per-port metrics */
+    metrics->ports = calloc(num_ports, sizeof(dpdk_port_metrics_t));
+    if (!metrics->ports) {
+        return -ENOMEM;
+    }
+    
+    /* Set the start time */
+    metrics->start_time_sec = get_timestamp_sec();
+    
+    printf("Metrics collection initialized for %u ports\n", num_ports);
+    return 0;
+}
+
+void dpdk_metrics_update(dpdk_metrics_t *metrics, uint16_t port, 
+                        uint32_t rx_packets, uint64_t rx_bytes,
+                        uint32_t processed_packets, uint64_t processing_time_us)
+{
+    if (!metrics || !metrics->ports) {
+        return;
+    }
+    
+    /* Update port-specific metrics */
+    metrics->ports[port].rx_packets += rx_packets;
+    metrics->ports[port].rx_bytes += rx_bytes;
+    metrics->ports[port].processed_packets += processed_packets;
+    metrics->ports[port].processing_time_us += processing_time_us;
+    
+    /* Update global metrics */
+    metrics->total_rx_packets += rx_packets;
+    metrics->total_rx_bytes += rx_bytes;
+    metrics->total_processed_packets += processed_packets;
+    metrics->total_processing_time_us += processing_time_us;
+}
+
+void dpdk_metrics_print(dpdk_metrics_t *metrics)
+{
+    if (!metrics || !metrics->ports) {
+        printf("No metrics available\n");
+        return;
+    }
+    
+    uint64_t current_time = get_timestamp_sec();
+    uint64_t runtime_sec = current_time - metrics->start_time_sec;
+    uint16_t num_ports = dpdk_get_port_count();
+    
+    printf("\n================================================================================\n");
+    printf("DPDK PACKET PROCESSING METRICS\n");
+    printf("================================================================================\n");
+    printf("Runtime: %"PRIu64" seconds\n", runtime_sec);
+    printf("Total RX Packets: %"PRIu64"\n", metrics->total_rx_packets);
+    printf("Total RX Bytes: %"PRIu64" (%.2f MB)\n", 
+           metrics->total_rx_bytes, 
+           metrics->total_rx_bytes / (1024.0 * 1024.0));
+    printf("Total Processed Packets: %"PRIu64"\n", metrics->total_processed_packets);
+    
+    if (runtime_sec > 0) {
+        printf("Average RX Rate: %.2f pps, %.2f Mbps\n",
+               (double)metrics->total_rx_packets / runtime_sec,
+               (double)metrics->total_rx_bytes * 8 / runtime_sec / (1024*1024));
+        
+        printf("Average Processing Rate: %.2f pps\n",
+               (double)metrics->total_processed_packets / runtime_sec);
+    }
+    
+    if (metrics->total_processed_packets > 0) {
+        printf("Average Processing Time: %.2f us per packet\n",
+               (double)metrics->total_processing_time_us / metrics->total_processed_packets);
+    }
+    
+    printf("\nPER-PORT STATISTICS:\n");
+    printf("%-5s %-12s %-12s %-12s %-15s\n",
+           "Port", "RX Packets", "RX Bytes", "Processed", "Avg Time (us)");
+    printf("--------------------------------------------------------------------------------\n");
+    
+    for (uint16_t port = 0; port < num_ports; port++) {
+        double avg_time = 0;
+        if (metrics->ports[port].processed_packets > 0) {
+            avg_time = (double)metrics->ports[port].processing_time_us / 
+                      metrics->ports[port].processed_packets;
+        }
+        
+        printf("%-5u %-12"PRIu64" %-12"PRIu64" %-12"PRIu64" %-15.2f\n",
+               port, 
+               metrics->ports[port].rx_packets, 
+               metrics->ports[port].rx_bytes,
+               metrics->ports[port].processed_packets,
+               avg_time);
+    }
+    printf("================================================================================\n");
+}
+
+void dpdk_metrics_cleanup(dpdk_metrics_t *metrics)
+{
+    if (metrics && metrics->ports) {
+        free(metrics->ports);
+        metrics->ports = NULL;
+    }
+}
+
+#if DPDK_GPU_SUPPORT
+/* GPU-related API implementations */
+
+void* dpdk_gpu_mem_alloc(int16_t dev_id, size_t size, unsigned int flags)
+{
+    return rte_gpu_mem_alloc(dev_id, size, flags);
+}
+
+int dpdk_gpu_mem_free(int16_t dev_id, void *ptr)
+{
+    return rte_gpu_mem_free(dev_id, ptr);
+}
+
+int dpdk_gpu_comm_create_flag(int16_t dev_id, void *flag, int flag_type)
+{
+    return rte_gpu_comm_create_flag(dev_id, flag, flag_type);
+}
+
+int dpdk_gpu_comm_set_flag(void *flag, uint32_t value)
+{
+    return rte_gpu_comm_set_flag(flag, value);
+}
+
+void* dpdk_gpu_comm_create_list(int16_t dev_id, int num_entries)
+{
+    return rte_gpu_comm_create_list(dev_id, num_entries);
+}
+
+int dpdk_gpu_comm_populate_list_pkts(void *comm_list, void **pkts, int nb_pkts)
+{
+    return rte_gpu_comm_populate_list_pkts(comm_list, pkts, nb_pkts);
+}
+
+int dpdk_gpu_comm_cleanup_list(void *comm_list)
+{
+    return rte_gpu_comm_cleanup_list(comm_list);
+}
+
+int dpdk_extmem_register(void *addr, size_t len, void *context, uint64_t iova, size_t page_size)
+{
+    return rte_extmem_register(addr, len, context, iova, page_size);
+}
+
+int dpdk_dev_dma_map(uint16_t port_id, void *addr, uint64_t iova, size_t len)
+{
+    struct rte_device *dev = rte_eth_devices[port_id].device;
+    return rte_dev_dma_map(dev, addr, iova, len);
+}
+#endif /* DPDK_GPU_SUPPORT */ 

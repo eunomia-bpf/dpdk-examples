@@ -4,18 +4,14 @@
 #include <stdint.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <time.h>
+#include <sys/time.h>
 
-#include <rte_eal.h>
-#include <rte_ethdev.h>
-#include <rte_mbuf.h>
-#include <rte_mempool.h>
-#include <rte_gpu.h>
-#include <rte_gpu_comm.h>
-
+#include "dpdk_driver.h"
 #include <cuda_runtime.h>
 
 //////////////////////////////////////////////////////////////////////////
-///// gpudev library + CUDA functions
+///// CUDA kernel and processing definitions
 //////////////////////////////////////////////////////////////////////////
 #define GPU_PAGE_SHIFT 16
 #define GPU_PAGE_SIZE (1UL << GPU_PAGE_SHIFT)
@@ -24,9 +20,13 @@
 #define MBUFS_NUM 1024
 #define MBUFS_HEADROOM_SIZE 256
 #define COMM_LIST_ENTRIES 8
+#define MAX_PORTS 32
 
 /* Signal handler */
 static volatile bool force_quit = false;
+
+/* Metrics */
+static dpdk_metrics_t g_metrics;
 
 static void signal_handler(int signum)
 {
@@ -34,6 +34,14 @@ static void signal_handler(int signum)
         printf("\nSignal %d received, preparing to exit...\n", signum);
         force_quit = true;
     }
+}
+
+/* Get timestamp in microseconds */
+static uint64_t get_timestamp_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)(ts.tv_sec * 1000000 + ts.tv_nsec / 1000);
 }
 
 /* CUDA kernel for packet processing */
@@ -81,10 +89,34 @@ int main(int argc, char *argv[])
     printf("DPDK GPU Packet Processing Application\n");
     printf("======================================\n");
     
-    /* Initialize the EAL */
-    int ret = rte_eal_init(argc, argv);
-    if (ret < 0)
-        rte_exit(EXIT_FAILURE, "Error with EAL initialization\n");
+    /* Initialize the DPDK driver */
+    dpdk_config_t config = DPDK_DEFAULT_CONFIG;
+    config.burst_size = MAX_RX_MBUFS;  /* Maximum burst size */
+    
+    int ret = dpdk_init(argc, argv, &config);
+    if (ret != 0) {
+        printf("Failed to initialize DPDK: %d\n", ret);
+        exit(EXIT_FAILURE);
+    }
+    
+    /* Initialize metrics */
+    uint16_t port_count = dpdk_get_port_count();
+    if (port_count == 0) {
+        printf("No ports found! Make sure to use --vdev option.\n");
+        printf("Examples:\n");
+        printf("  %s --vdev=net_null0 -l 0\n", argv[0]);
+        printf("  %s --vdev=net_tap0,iface=test0 -l 0\n", argv[0]);
+        printf("  %s --vdev=net_ring0 -l 0\n", argv[0]);
+        dpdk_cleanup();
+        exit(EXIT_FAILURE);
+    }
+    
+    ret = dpdk_metrics_init(&g_metrics, port_count);
+    if (ret != 0) {
+        printf("Failed to initialize metrics: %d\n", ret);
+        dpdk_cleanup();
+        exit(EXIT_FAILURE);
+    }
     
     struct rte_gpu_flag quit_flag;
     struct rte_gpu_comm_list *comm_list;
@@ -102,6 +134,8 @@ int main(int argc, char *argv[])
     cudaError_t cuda_status = cudaStreamCreate(&cstream);
     if (cuda_status != cudaSuccess) {
         printf("Failed to create CUDA stream: %s\n", cudaGetErrorString(cuda_status));
+        dpdk_metrics_cleanup(&g_metrics);
+        dpdk_cleanup();
         return EXIT_FAILURE;
     }
     
@@ -112,22 +146,29 @@ int main(int argc, char *argv[])
     ext_mem.elt_size = MBUFS_HEADROOM_SIZE;
     ext_mem.buf_len = RTE_ALIGN_CEIL(MBUFS_NUM * ext_mem.elt_size, GPU_PAGE_SIZE);
     ext_mem.buf_iova = RTE_BAD_IOVA;
-    ext_mem.buf_ptr = rte_gpu_mem_alloc(dev_id, ext_mem.buf_len, 0);
+    ext_mem.buf_ptr = dpdk_gpu_mem_alloc(dev_id, ext_mem.buf_len, 0);
     if (ext_mem.buf_ptr == NULL) {
         printf("Failed to allocate GPU memory\n");
+        dpdk_metrics_cleanup(&g_metrics);
+        dpdk_cleanup();
         return EXIT_FAILURE;
     }
     
-    ret = rte_extmem_register(ext_mem.buf_ptr, ext_mem.buf_len, NULL, ext_mem.buf_iova, GPU_PAGE_SIZE);
+    ret = dpdk_extmem_register(ext_mem.buf_ptr, ext_mem.buf_len, NULL, ext_mem.buf_iova, GPU_PAGE_SIZE);
     if (ret != 0) {
         printf("Failed to register external memory: %d\n", ret);
+        dpdk_gpu_mem_free(dev_id, ext_mem.buf_ptr);
+        dpdk_metrics_cleanup(&g_metrics);
+        dpdk_cleanup();
         return EXIT_FAILURE;
     }
     
-    ret = rte_dev_dma_map(rte_eth_devices[port_id].device,
-            ext_mem.buf_ptr, ext_mem.buf_iova, ext_mem.buf_len);
+    ret = dpdk_dev_dma_map(port_id, ext_mem.buf_ptr, ext_mem.buf_iova, ext_mem.buf_len);
     if (ret != 0) {
         printf("Failed to map DMA memory: %d\n", ret);
+        dpdk_gpu_mem_free(dev_id, ext_mem.buf_ptr);
+        dpdk_metrics_cleanup(&g_metrics);
+        dpdk_cleanup();
         return EXIT_FAILURE;
     }
     
@@ -136,6 +177,9 @@ int main(int argc, char *argv[])
                                                    rte_socket_id(), &ext_mem, 1);
     if (mpool_payload == NULL) {
         printf("Failed to create mempool: %s\n", rte_strerror(rte_errno));
+        dpdk_gpu_mem_free(dev_id, ext_mem.buf_ptr);
+        dpdk_metrics_cleanup(&g_metrics);
+        dpdk_cleanup();
         return EXIT_FAILURE;
     }
     
@@ -143,47 +187,28 @@ int main(int argc, char *argv[])
      * Create CPU - device communication flag.
      * With this flag, the CPU can tell to the CUDA kernel to exit from the main loop.
      */
-    ret = rte_gpu_comm_create_flag(dev_id, &quit_flag, RTE_GPU_COMM_FLAG_CPU);
+    ret = dpdk_gpu_comm_create_flag(dev_id, &quit_flag, RTE_GPU_COMM_FLAG_CPU);
     if (ret != 0) {
         printf("Failed to create GPU communication flag: %d\n", ret);
+        dpdk_gpu_mem_free(dev_id, ext_mem.buf_ptr);
+        dpdk_metrics_cleanup(&g_metrics);
+        dpdk_cleanup();
         return EXIT_FAILURE;
     }
     
-    rte_gpu_comm_set_flag(&quit_flag, 0);
+    dpdk_gpu_comm_set_flag(&quit_flag, 0);
     
     /*
      * Create CPU - device communication list.
      * Each entry of this list will be populated by the CPU
      * with a new set of received mbufs that the CUDA kernel has to process.
      */
-    comm_list = rte_gpu_comm_create_list(dev_id, COMM_LIST_ENTRIES);
+    comm_list = dpdk_gpu_comm_create_list(dev_id, COMM_LIST_ENTRIES);
     if (comm_list == NULL) {
         printf("Failed to create GPU communication list\n");
-        return EXIT_FAILURE;
-    }
-    
-    /* Configure and start the port */
-    ret = rte_eth_dev_configure(port_id, 1, 1, NULL);
-    if (ret < 0) {
-        printf("Failed to configure Ethernet device: %d\n", ret);
-        return EXIT_FAILURE;
-    }
-    
-    ret = rte_eth_rx_queue_setup(port_id, queue_id, 128, rte_eth_dev_socket_id(port_id), NULL, mpool_payload);
-    if (ret < 0) {
-        printf("Failed to setup RX queue: %d\n", ret);
-        return EXIT_FAILURE;
-    }
-    
-    ret = rte_eth_tx_queue_setup(port_id, queue_id, 128, rte_eth_dev_socket_id(port_id), NULL);
-    if (ret < 0) {
-        printf("Failed to setup TX queue: %d\n", ret);
-        return EXIT_FAILURE;
-    }
-    
-    ret = rte_eth_dev_start(port_id);
-    if (ret < 0) {
-        printf("Failed to start Ethernet device: %d\n", ret);
+        dpdk_gpu_mem_free(dev_id, ext_mem.buf_ptr);
+        dpdk_metrics_cleanup(&g_metrics);
+        dpdk_cleanup();
         return EXIT_FAILURE;
     }
     
@@ -193,23 +218,57 @@ int main(int argc, char *argv[])
     
     printf("Packet processing running on GPU. Press Ctrl+C to exit...\n");
     
+    /* Define arrays for metrics calculation */
+    uint32_t rx_packets_by_port[MAX_PORTS] = {0};
+    uint64_t rx_bytes_by_port[MAX_PORTS] = {0};
+    
     /* Main processing loop */
     while (!force_quit) {
-        /* Receive packets */
-        nb_rx = rte_eth_rx_burst(port_id, queue_id, rx_mbufs, MAX_RX_MBUFS);
-        if (nb_rx > 0) {
-            /* Send packets to GPU for processing */
-            rte_gpu_comm_populate_list_pkts(&comm_list[comm_list_entry], rx_mbufs, nb_rx);
+        /* Track processing time */
+        uint64_t start_time = get_timestamp_us();
+        
+        /* Process each port */
+        for (uint16_t port = 0; port < port_count; port++) {
+            /* Reset counters for this iteration */
+            rx_packets_by_port[port] = 0;
+            rx_bytes_by_port[port] = 0;
             
-            /* Move to next entry in comm list */
-            comm_list_entry = (comm_list_entry + 1) % COMM_LIST_ENTRIES;
+            /* Receive packets from this port */
+            nb_rx = rte_eth_rx_burst(port, queue_id, rx_mbufs, MAX_RX_MBUFS);
             
-            /* Wait for GPU to process previous batches if needed */
-            if (comm_list_entry % 2 == 0) {
-                int prev_entry = (comm_list_entry - 2 + COMM_LIST_ENTRIES) % COMM_LIST_ENTRIES;
-                while (rte_gpu_comm_cleanup_list(&comm_list[prev_entry])) {
-                    /* Wait for cleanup */
+            if (nb_rx > 0) {
+                /* Calculate total bytes */
+                for (int i = 0; i < nb_rx; i++) {
+                    rx_bytes_by_port[port] += rte_pktmbuf_pkt_len(rx_mbufs[i]);
                 }
+                rx_packets_by_port[port] = nb_rx;
+                
+                /* Send packets to GPU for processing */
+                dpdk_gpu_comm_populate_list_pkts(&comm_list[comm_list_entry], (void **)rx_mbufs, nb_rx);
+                
+                /* Move to next entry in comm list */
+                comm_list_entry = (comm_list_entry + 1) % COMM_LIST_ENTRIES;
+                
+                /* Wait for GPU to process previous batches if needed */
+                if (comm_list_entry % 2 == 0) {
+                    int prev_entry = (comm_list_entry - 2 + COMM_LIST_ENTRIES) % COMM_LIST_ENTRIES;
+                    while (dpdk_gpu_comm_cleanup_list(&comm_list[prev_entry])) {
+                        /* Wait for cleanup */
+                    }
+                }
+            }
+        }
+        
+        /* Calculate processing time */
+        uint64_t end_time = get_timestamp_us();
+        uint64_t processing_time = end_time - start_time;
+        
+        /* Update metrics for each port */
+        for (uint16_t port = 0; port < port_count; port++) {
+            if (rx_packets_by_port[port] > 0) {
+                dpdk_metrics_update(&g_metrics, port, 
+                                  rx_packets_by_port[port], rx_bytes_by_port[port],
+                                  rx_packets_by_port[port], processing_time);
             }
         }
     }
@@ -218,27 +277,27 @@ int main(int argc, char *argv[])
     
     /* Cleanup any remaining comm list entries */
     for (int i = 0; i < COMM_LIST_ENTRIES; i++) {
-        while (rte_gpu_comm_cleanup_list(&comm_list[i])) {
+        while (dpdk_gpu_comm_cleanup_list(&comm_list[i])) {
             /* Wait for cleanup */
         }
     }
     
     /* CPU notifies the CUDA kernel that it has to terminate. */
-    rte_gpu_comm_set_flag(&quit_flag, 1);
+    dpdk_gpu_comm_set_flag(&quit_flag, 1);
     
     /* Wait for CUDA kernel to complete */
     cudaStreamSynchronize(cstream);
     
-    /* Stop the port and release resources */
-    rte_eth_dev_stop(port_id);
-    rte_eth_dev_close(port_id);
+    /* Print metrics */
+    dpdk_metrics_print(&g_metrics);
     
-    /* gpudev objects cleanup/destruction */
-    rte_gpu_mem_free(dev_id, ext_mem.buf_ptr);
+    /* Cleanup resources */
+    dpdk_metrics_cleanup(&g_metrics);
+    dpdk_gpu_mem_free(dev_id, ext_mem.buf_ptr);
     cudaStreamDestroy(cstream);
     
-    /* Clean up the EAL */
-    rte_eal_cleanup();
+    /* Clean up the driver */
+    dpdk_cleanup();
     
     printf("Goodbye!\n");
     return 0;
