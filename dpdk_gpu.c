@@ -16,12 +16,13 @@
 #include <rte_mbuf.h>
 #include <rte_ether.h>
 #include <rte_errno.h>
+#include <rte_gpudev.h>
 
 #include "dpdk_driver.h"
-#include <cuda_runtime.h>
+#include "dpdk_gpu.h"
 
 //////////////////////////////////////////////////////////////////////////
-///// CUDA kernel and processing definitions
+///// GPU processing definitions
 //////////////////////////////////////////////////////////////////////////
 #define GPU_PAGE_SHIFT 16
 #define GPU_PAGE_SIZE (1UL << GPU_PAGE_SHIFT)
@@ -32,26 +33,11 @@
 #define COMM_LIST_ENTRIES 8
 #define MAX_PORTS 32
 
-#define GPU_COMM_LIST_READY 1
-#define GPU_COMM_LIST_PKTS_MAX 64
-#define GPU_COMM_FLAG_CPU 0
-
 /* Signal handler */
 static volatile bool force_quit = false;
 
 /* Metrics */
 static dpdk_metrics_t g_metrics;
-
-/* Simple CUDA structures */
-struct gpu_flag {
-    uint32_t *ptr;
-};
-
-struct gpu_comm_list {
-    uint32_t *status_d;
-    uint16_t num_pkts;
-    void *addr[GPU_COMM_LIST_PKTS_MAX];
-};
 
 static void signal_handler(int signum)
 {
@@ -68,35 +54,6 @@ static uint64_t get_timestamp_us(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)(ts.tv_sec * 1000000 + ts.tv_nsec / 1000);
 }
-
-#ifdef __CUDACC__
-/* CUDA kernel for simple packet processing */
-__global__ void cuda_packet_processing(uint32_t *quit_flag, 
-                                      struct gpu_comm_list *comm_list, 
-                                      int list_count)
-{
-    int list_index = 0;
-    
-    while (*quit_flag == 0) {
-        if (comm_list[list_index].status_d[0] != GPU_COMM_LIST_READY)
-            continue;
-            
-        int packet_idx = threadIdx.x;
-        if (packet_idx < comm_list[list_index].num_pkts) {
-            uint8_t *packet = (uint8_t *)comm_list[list_index].addr[packet_idx];
-            if (packet != NULL) {
-                /* Increment first byte */
-                packet[0]++;
-            }
-        }
-        
-        __threadfence();
-        __syncthreads();
-        
-        list_index = (list_index + 1) % list_count;
-    }
-}
-#endif
 
 int main(int argc, char *argv[])
 {
@@ -131,90 +88,75 @@ int main(int argc, char *argv[])
         exit(EXIT_FAILURE);
     }
     
-    struct gpu_flag quit_flag = {0};
-    struct gpu_comm_list *comm_list = NULL;
+    struct rte_gpu_comm_flag quit_flag;
+    struct rte_gpu_comm_list *comm_list = NULL;
     int nb_rx = 0;
     int queue_id = 0;
     struct rte_mbuf *rx_mbufs[MAX_RX_MBUFS];
     cudaStream_t cuda_stream;
-    int gpu_device_id = 0;
+    int16_t gpu_dev_id = 0;
     
     /* Initialize CUDA */
-    cudaError_t cuda_status;
-    cuda_status = cudaSetDevice(gpu_device_id);
-    if (cuda_status != cudaSuccess) {
-        printf("Failed to set CUDA device: %s\n", cudaGetErrorString(cuda_status));
+    ret = init_cuda_device(gpu_dev_id);
+    if (ret != 0) {
+        printf("Failed to set CUDA device\n");
         dpdk_metrics_cleanup(&g_metrics);
         dpdk_cleanup();
         return EXIT_FAILURE;
     }
     
-    cuda_status = cudaStreamCreate(&cuda_stream);
-    if (cuda_status != cudaSuccess) {
-        printf("Failed to create CUDA stream: %s\n", cudaGetErrorString(cuda_status));
+    ret = create_cuda_stream(&cuda_stream);
+    if (ret != 0) {
+        printf("Failed to create CUDA stream\n");
         dpdk_metrics_cleanup(&g_metrics);
         dpdk_cleanup();
         return EXIT_FAILURE;
     }
     
-    /* Allocate GPU memory for flag */
-    uint32_t *d_quit_flag;
-    cuda_status = cudaMalloc((void**)&d_quit_flag, sizeof(uint32_t));
-    if (cuda_status != cudaSuccess) {
-        printf("Failed to allocate flag memory: %s\n", cudaGetErrorString(cuda_status));
-        cudaStreamDestroy(cuda_stream);
+    /* Create communication flag using DPDK GPU API */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    ret = rte_gpu_comm_create_flag(gpu_dev_id, &quit_flag, RTE_GPU_COMM_FLAG_CPU);
+    if (ret != 0) {
+        printf("Failed to create GPU communication flag: %d\n", ret);
+        destroy_cuda_stream(cuda_stream);
         dpdk_metrics_cleanup(&g_metrics);
         dpdk_cleanup();
         return EXIT_FAILURE;
     }
     
-    cuda_status = cudaMemset(d_quit_flag, 0, sizeof(uint32_t));
-    if (cuda_status != cudaSuccess) {
-        printf("Failed to initialize flag: %s\n", cudaGetErrorString(cuda_status));
-        cudaFree(d_quit_flag);
-        cudaStreamDestroy(cuda_stream);
+    /* Set initial flag value to 0 */
+    ret = rte_gpu_comm_set_flag(&quit_flag, 0);
+    if (ret != 0) {
+        printf("Failed to set GPU flag: %d\n", ret);
+        rte_gpu_comm_destroy_flag(&quit_flag);
+        destroy_cuda_stream(cuda_stream);
         dpdk_metrics_cleanup(&g_metrics);
         dpdk_cleanup();
         return EXIT_FAILURE;
     }
     
-    quit_flag.ptr = d_quit_flag;
-    
-    /* Allocate GPU memory for communication list */
-    cuda_status = cudaMalloc((void**)&comm_list, COMM_LIST_ENTRIES * sizeof(struct gpu_comm_list));
-    if (cuda_status != cudaSuccess) {
-        printf("Failed to allocate comm list memory: %s\n", cudaGetErrorString(cuda_status));
-        cudaFree(d_quit_flag);
-        cudaStreamDestroy(cuda_stream);
+    /* Create communication list using DPDK GPU API */
+    comm_list = rte_gpu_comm_create_list(gpu_dev_id, COMM_LIST_ENTRIES);
+    if (comm_list == NULL) {
+        printf("Failed to create GPU communication list: %d\n", rte_errno);
+        rte_gpu_comm_destroy_flag(&quit_flag);
+        destroy_cuda_stream(cuda_stream);
         dpdk_metrics_cleanup(&g_metrics);
         dpdk_cleanup();
         return EXIT_FAILURE;
     }
+#pragma GCC diagnostic pop
+
+    /* Start CUDA kernel for packet processing */
+    launch_packet_processing(quit_flag.ptr, comm_list, COMM_LIST_ENTRIES, cuda_stream);
     
-    cuda_status = cudaMemset(comm_list, 0, COMM_LIST_ENTRIES * sizeof(struct gpu_comm_list));
-    if (cuda_status != cudaSuccess) {
-        printf("Failed to initialize comm list: %s\n", cudaGetErrorString(cuda_status));
-        cudaFree(comm_list);
-        cudaFree(d_quit_flag);
-        cudaStreamDestroy(cuda_stream);
-        dpdk_metrics_cleanup(&g_metrics);
-        dpdk_cleanup();
-        return EXIT_FAILURE;
-    }
-    
-    /* Start CUDA kernel */
-    #ifdef __CUDACC__
-    cuda_packet_processing<<<1, GPU_COMM_LIST_PKTS_MAX, 0, cuda_stream>>>(
-        d_quit_flag, comm_list, COMM_LIST_ENTRIES);
-    #else
-    printf("CUDA compilation not available, using CPU for packet processing\n");
-    #endif
-    
-    printf("Packet processing started. Press Ctrl+C to exit...\n");
+    printf("GPU packet processing started. Press Ctrl+C to exit...\n");
     
     /* Arrays for metrics calculation */
     uint32_t rx_packets_by_port[MAX_PORTS] = {0};
     uint64_t rx_bytes_by_port[MAX_PORTS] = {0};
+    int current_list = 0;
     
     /* Main processing loop */
     while (!force_quit) {
@@ -235,20 +177,44 @@ int main(int argc, char *argv[])
                 }
                 rx_packets_by_port[port] = nb_rx;
                 
-                /* Process packets on CPU for now - GPU integration is simplified */
-                for (int i = 0; i < nb_rx; i++) {
-                    /* Simple processing - increment first byte */
-                    uint8_t *data = rte_pktmbuf_mtod(rx_mbufs[i], uint8_t *);
-                    if (data != NULL) {
-                        data[0]++;
-                    }
-                }
+                /* Check if current list is free */
+                enum rte_gpu_comm_list_status status;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+                rte_gpu_comm_get_status(&comm_list[current_list], &status);
                 
-                /* Free mbufs */
-                for (int i = 0; i < nb_rx; i++) {
-                    rte_pktmbuf_free(rx_mbufs[i]);
+                if (status == RTE_GPU_COMM_LIST_FREE) {
+                    /* Populate the list with packet data and mark as ready for GPU */
+                    rte_gpu_comm_populate_list_pkts(&comm_list[current_list], rx_mbufs, nb_rx);
+                    rte_gpu_comm_set_status(&comm_list[current_list], RTE_GPU_COMM_LIST_READY);
+                    
+                    /* Ensure memory coherency */
+                    rte_gpu_wmb(gpu_dev_id);
+                    
+                    /* Move to next list */
+                    current_list = (current_list + 1) % COMM_LIST_ENTRIES;
+                } else {
+                    /* Free mbufs if we can't process them (we don't want any CPU fallback) */
+                    for (int i = 0; i < nb_rx; i++) {
+                        rte_pktmbuf_free(rx_mbufs[i]);
+                    }
+                    printf("Warning: Dropped packets due to no available GPU processing slots\n");
                 }
             }
+            
+            /* Check for completed processing in GPU */
+            for (int i = 0; i < COMM_LIST_ENTRIES; i++) {
+                if (i != current_list) {
+                    enum rte_gpu_comm_list_status status;
+                    rte_gpu_comm_get_status(&comm_list[i], &status);
+                    
+                    if (status == RTE_GPU_COMM_LIST_DONE) {
+                        /* Cleanup list and free mbufs */
+                        rte_gpu_comm_cleanup_list(&comm_list[i]);
+                    }
+                }
+            }
+#pragma GCC diagnostic pop
         }
         
         /* Calculate processing time */
@@ -268,19 +234,25 @@ int main(int argc, char *argv[])
     printf("\nCleaning up...\n");
     
     /* Set quit flag for CUDA kernel */
-    cudaMemset(d_quit_flag, 1, sizeof(uint32_t));
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    rte_gpu_comm_set_flag(&quit_flag, 1);
+#pragma GCC diagnostic pop
     
     /* Wait for CUDA kernel to complete */
-    cudaStreamSynchronize(cuda_stream);
+    sync_cuda_stream(cuda_stream);
     
     /* Print metrics */
     dpdk_metrics_print(&g_metrics);
     
     /* Cleanup resources */
     dpdk_metrics_cleanup(&g_metrics);
-    cudaFree(comm_list);
-    cudaFree(d_quit_flag);
-    cudaStreamDestroy(cuda_stream);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    rte_gpu_comm_destroy_list(comm_list, COMM_LIST_ENTRIES);
+    rte_gpu_comm_destroy_flag(&quit_flag);
+#pragma GCC diagnostic pop
+    destroy_cuda_stream(cuda_stream);
     
     /* Clean up the driver */
     dpdk_cleanup();
